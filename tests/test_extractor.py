@@ -1,3 +1,4 @@
+import json
 import os
 import tarfile
 import zipfile
@@ -175,3 +176,39 @@ class TestArchiveExtractor:
         assert (output_dir / "file1.txt").read_text() == "hello"
         assert (output_dir / "sub" / "file2.txt").read_text() == "world"
         assert len(files) == 2
+
+    def test_process_converts_zarr_v2_to_v3(self, tmp_path):
+        """Zip with a Zarr v2 store should be converted to v3 during process()."""
+        input_dir = tmp_path / "input"
+        output_dir = tmp_path / "output"
+        input_dir.mkdir()
+
+        zarray = {
+            "zarr_format": 2,
+            "shape": [64, 64],
+            "chunks": [32, 32],
+            "dtype": "<u1",
+            "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": 1, "blocksize": 0},
+            "fill_value": 0,
+            "order": "C",
+            "filters": None,
+            "dimension_separator": "/",
+        }
+
+        zip_path = input_dir / "data.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("img.zarr/.zgroup", json.dumps({"zarr_format": 2}))
+            zf.writestr("img.zarr/.zattrs", json.dumps({"key": "value"}))
+            zf.writestr("img.zarr/0/.zarray", json.dumps(zarray))
+
+        extractor = ArchiveExtractor(str(input_dir), str(output_dir))
+        result_dir, files = extractor.process()
+
+        zarr_root = output_dir / "img.zarr"
+        assert (zarr_root / "zarr.json").exists()
+        meta = json.loads((zarr_root / "zarr.json").read_text())
+        assert meta["zarr_format"] == 3
+        assert meta["node_type"] == "group"
+
+        assert not (zarr_root / ".zgroup").exists()
+        assert not (zarr_root / ".zattrs").exists()

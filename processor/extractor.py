@@ -2,6 +2,7 @@ import logging
 import os
 
 from processor.utils import collect_files, extract_archive, get_archive_type
+from processor.zarr_converter import process_zarr_conversions
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +82,11 @@ class ArchiveExtractor:
         """
         archive_path = self.find_input_file()
         self.extract(archive_path)
+
+        converted = process_zarr_conversions(self.output_dir)
+        if converted:
+            log.info(f"Converted {len(converted)} zarr v2 store(s) to v3")
+
         files = self.collect_extracted_files()
 
         return self.output_dir, files
