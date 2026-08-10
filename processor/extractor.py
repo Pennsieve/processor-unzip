@@ -2,7 +2,7 @@ import logging
 import os
 
 from processor.utils import collect_files, extract_archive, get_archive_type
-from processor.zarr_converter import process_zarr_conversions
+from processor.zarr_converter import flatten_zarr_store, process_zarr_conversions
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +82,10 @@ class ArchiveExtractor:
         """
         archive_path = self.find_input_file()
         self.extract(archive_path)
+
+        flattened = flatten_zarr_store(self.output_dir)
+        if flattened:
+            log.info(f"Flattened zarr store from {flattened} to {self.output_dir}")
 
         converted = process_zarr_conversions(self.output_dir)
         if converted:

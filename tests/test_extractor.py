@@ -177,8 +177,8 @@ class TestArchiveExtractor:
         assert (output_dir / "sub" / "file2.txt").read_text() == "world"
         assert len(files) == 2
 
-    def test_process_converts_zarr_v2_to_v3(self, tmp_path):
-        """Zip with a Zarr v2 store should be converted to v3 during process()."""
+    def test_process_converts_zarr_v2_to_v3_at_root(self, tmp_path):
+        """Zip with a Zarr v2 store should be flattened to root and converted to v3."""
         input_dir = tmp_path / "input"
         output_dir = tmp_path / "output"
         input_dir.mkdir()
@@ -204,11 +204,11 @@ class TestArchiveExtractor:
         extractor = ArchiveExtractor(str(input_dir), str(output_dir))
         result_dir, files = extractor.process()
 
-        zarr_root = output_dir / "img.zarr"
-        assert (zarr_root / "zarr.json").exists()
-        meta = json.loads((zarr_root / "zarr.json").read_text())
+        # zarr.json at output root, not inside img.zarr/
+        assert (output_dir / "zarr.json").exists()
+        meta = json.loads((output_dir / "zarr.json").read_text())
         assert meta["zarr_format"] == 3
         assert meta["node_type"] == "group"
 
-        assert not (zarr_root / ".zgroup").exists()
-        assert not (zarr_root / ".zattrs").exists()
+        assert not (output_dir / "img.zarr").exists()
+        assert not (output_dir / ".zgroup").exists()

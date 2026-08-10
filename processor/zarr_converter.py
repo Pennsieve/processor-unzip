@@ -11,6 +11,7 @@ Self-contained module — no imports from other processor modules.
 import json
 import logging
 import os
+import shutil
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,52 @@ _DTYPE_KIND_MAP = {
     ("f", 4): "float32",
     ("f", 8): "float64",
 }
+
+
+def _is_zarr_root(path: str) -> bool:
+    """Check if a directory is the root of a zarr store (v2 or v3)."""
+    return os.path.isfile(os.path.join(path, ".zgroup")) or os.path.isfile(os.path.join(path, "zarr.json"))
+
+
+def flatten_zarr_store(output_dir: str) -> str | None:
+    """If a zarr store is nested in a subdirectory, move its contents to output_dir root.
+
+    Handles the common case where a zip extracts to output_dir/name.zarr/.
+    The downstream pipeline expects zarr.json at the output root.
+
+    Returns the original subdirectory path if flattened, None otherwise.
+    """
+    if _is_zarr_root(output_dir):
+        return None
+
+    # Find zarr stores anywhere in the tree
+    candidates = []
+    for root, _dirs, files in os.walk(output_dir):
+        if ".zgroup" in files or "zarr.json" in files:
+            candidates.append(root)
+
+    if not candidates:
+        return None
+
+    # Pick the shallowest store
+    candidates.sort(key=lambda p: p.count(os.sep))
+    zarr_root = candidates[0]
+
+    log.info(f"Flattening zarr store {zarr_root} → {output_dir}")
+
+    for item in os.listdir(zarr_root):
+        shutil.move(os.path.join(zarr_root, item), os.path.join(output_dir, item))
+
+    # Remove the now-empty directory and any empty parents up to (not including) output_dir
+    current = zarr_root
+    while current != output_dir:
+        try:
+            os.rmdir(current)
+        except OSError:
+            break
+        current = os.path.dirname(current)
+
+    return zarr_root
 
 
 def find_zarr_stores(output_dir: str) -> list[str]:

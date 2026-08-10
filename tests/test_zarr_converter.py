@@ -11,6 +11,7 @@ from processor.zarr_converter import (
     _parse_dtype,
     convert_zarr_v2_to_v3,
     find_zarr_stores,
+    flatten_zarr_store,
     is_zarr_v2,
     process_zarr_conversions,
 )
@@ -61,6 +62,69 @@ SAMPLE_ZARRAY = {
     "filters": None,
     "dimension_separator": "/",
 }
+
+
+# ---------------------------------------------------------------------------
+# Flatten tests
+# ---------------------------------------------------------------------------
+
+class TestFlattenZarrStore:
+    def test_flattens_v2_store(self, tmp_path):
+        output = tmp_path / "output"
+        store = output / "my.zarr"
+        _make_v2_store(str(store), arrays={"0": SAMPLE_ZARRAY})
+
+        result = flatten_zarr_store(str(output))
+
+        assert result == str(store)
+        assert (output / ".zgroup").exists()
+        assert (output / "0" / ".zarray").exists()
+        assert not store.exists()
+
+    def test_flattens_v3_store(self, tmp_path):
+        output = tmp_path / "output"
+        store = output / "my.zarr"
+        store.mkdir(parents=True)
+        _write_json(str(store / "zarr.json"), {"zarr_format": 3, "node_type": "group", "attributes": {}})
+        (store / "0").mkdir()
+        _write_json(str(store / "0" / "zarr.json"), {"zarr_format": 3, "node_type": "array"})
+
+        result = flatten_zarr_store(str(output))
+
+        assert result is not None
+        assert (output / "zarr.json").exists()
+        assert (output / "0" / "zarr.json").exists()
+        assert not store.exists()
+
+    def test_noop_when_already_at_root(self, tmp_path):
+        output = tmp_path / "output"
+        _make_v2_store(str(output), arrays={"0": SAMPLE_ZARRAY})
+
+        result = flatten_zarr_store(str(output))
+
+        assert result is None
+        assert (output / ".zgroup").exists()
+
+    def test_noop_when_no_zarr(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        (output / "readme.txt").write_text("hello")
+
+        result = flatten_zarr_store(str(output))
+
+        assert result is None
+
+    def test_preserves_chunk_data(self, tmp_path):
+        output = tmp_path / "output"
+        store = output / "data.zarr"
+        _make_v2_store(str(store), arrays={"0": SAMPLE_ZARRAY})
+        chunk_dir = store / "0" / "0"
+        chunk_dir.mkdir(parents=True)
+        (chunk_dir / "0").write_bytes(b"\xde\xad\xbe\xef")
+
+        flatten_zarr_store(str(output))
+
+        assert (output / "0" / "0" / "0").read_bytes() == b"\xde\xad\xbe\xef"
 
 
 # ---------------------------------------------------------------------------
@@ -363,15 +427,14 @@ class TestProcessZarrConversions:
 # ---------------------------------------------------------------------------
 
 class TestZipIntegration:
-    def test_zip_with_v2_zarr(self, tmp_path):
-        """Zip containing a v2 zarr store → extract → convert → v3 output."""
+    def test_zip_with_v2_zarr_flattened_to_root(self, tmp_path):
+        """Zip containing a v2 zarr store → extract → flatten → convert → v3 at root."""
         from processor.extractor import ArchiveExtractor
 
         input_dir = tmp_path / "input"
         output_dir = tmp_path / "output"
         input_dir.mkdir()
 
-        # Build a zip with a v2 zarr inside
         zip_path = input_dir / "dataset.zip"
         with zipfile.ZipFile(zip_path, "w") as zf:
             zf.writestr("sample.zarr/.zgroup", json.dumps({"zarr_format": 2}))
@@ -384,24 +447,24 @@ class TestZipIntegration:
         extractor = ArchiveExtractor(str(input_dir), str(output_dir))
         result_dir, files = extractor.process()
 
-        zarr_root = output_dir / "sample.zarr"
-
-        # v3 metadata created
-        assert (zarr_root / "zarr.json").exists()
-        root_meta = json.loads((zarr_root / "zarr.json").read_text())
+        # zarr.json at output root (flattened from sample.zarr/)
+        assert (output_dir / "zarr.json").exists()
+        root_meta = json.loads((output_dir / "zarr.json").read_text())
         assert root_meta["zarr_format"] == 3
         assert root_meta["node_type"] == "group"
 
-        assert (zarr_root / "0" / "zarr.json").exists()
-        arr_meta = json.loads((zarr_root / "0" / "zarr.json").read_text())
+        assert (output_dir / "0" / "zarr.json").exists()
+        arr_meta = json.loads((output_dir / "0" / "zarr.json").read_text())
         assert arr_meta["node_type"] == "array"
 
         # v2 files removed
-        assert not (zarr_root / ".zgroup").exists()
-        assert not (zarr_root / ".zattrs").exists()
-        assert not (zarr_root / "0" / ".zarray").exists()
+        assert not (output_dir / ".zgroup").exists()
+        assert not (output_dir / ".zattrs").exists()
 
-        # Collected files reflect v3 output
+        # Original subdirectory removed
+        assert not (output_dir / "sample.zarr").exists()
+
+        # Collected files reflect flattened v3 output
         rel_paths = {rel for _, rel in files}
-        assert os.path.join("sample.zarr", "zarr.json") in rel_paths
-        assert os.path.join("sample.zarr", "0", "zarr.json") in rel_paths
+        assert "zarr.json" in rel_paths
+        assert os.path.join("0", "zarr.json") in rel_paths
