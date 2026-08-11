@@ -218,7 +218,7 @@ def _build_v3_array_metadata(zarray: dict, zattrs: dict | None = None) -> dict:
             "configuration": {"chunk_shape": zarray["chunks"]},
         },
         "chunk_key_encoding": {
-            "name": "default",
+            "name": "v2",
             "configuration": {"separator": separator},
         },
         "fill_value": fill_value,
