@@ -248,6 +248,52 @@ def _write_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _add_omero_window(zarr_path: str, root) -> None:
+    """Compute min/max from the smallest resolution level and add OMERO window metadata.
+
+    This sets the rendering range so viewers like Neuroglancer display
+    the correct contrast without manual adjustment.
+    """
+    import numpy as np
+
+    multiscales = root.attrs.get("multiscales")
+    if not multiscales or "omero" in root.attrs:
+        return
+
+    datasets = multiscales[0].get("datasets", [])
+    if not datasets:
+        return
+
+    # Use the smallest (last) resolution level for fast min/max
+    smallest_path = datasets[-1]["path"]
+    try:
+        arr = root[smallest_path]
+        data = arr[:]
+        data_min, data_max = int(data.min()), int(data.max())
+    except Exception as e:
+        log.warning(f"  Could not compute min/max for OMERO window: {e}")
+        return
+
+    log.info(f"  Computed rendering window from level {smallest_path}: {data_min}–{data_max}")
+
+    # Update root zarr.json with OMERO channel metadata
+    zarr_json_path = os.path.join(zarr_path, "zarr.json")
+    meta = _read_json(zarr_json_path)
+    meta["attributes"]["omero"] = {
+        "channels": [
+            {
+                "color": "FFFFFF",
+                "label": "0",
+                "active": True,
+                "window": {"start": data_min, "end": data_max, "min": data_min, "max": data_max},
+            }
+        ],
+        "rdefs": {"model": "greyscale"},
+    }
+    _write_json(zarr_json_path, meta)
+    log.info(f"  Added OMERO rendering window to {zarr_json_path}")
+
+
 def convert_zarr_v2_to_v3(zarr_path: str) -> None:
     """Convert a Zarr v2 store to v3 format in-place.
 
@@ -291,12 +337,14 @@ def convert_zarr_v2_to_v3(zarr_path: str) -> None:
         os.remove(path)
         log.debug(f"  Removed {path}")
 
-    # Verify with zarr-python v3
+    # Verify with zarr-python v3 and compute rendering window
     try:
         import zarr
 
-        zarr.open_group(zarr_path, mode="r")
+        root = zarr.open_group(zarr_path, mode="r")
         log.info(f"  Verified: zarr.open_group succeeded for {zarr_path}")
+
+        _add_omero_window(zarr_path, root)
     except Exception as e:
         log.error(f"  Verification failed for {zarr_path}: {e}")
         raise
