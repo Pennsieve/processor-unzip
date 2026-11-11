@@ -468,3 +468,102 @@ class TestZipIntegration:
         rel_paths = {rel for _, rel in files}
         assert "zarr.json" in rel_paths
         assert os.path.join("0", "zarr.json") in rel_paths
+
+
+# ---------------------------------------------------------------------------
+# OMERO rendering metadata (channel colors and windows)
+# ---------------------------------------------------------------------------
+
+def _make_real_v2_image(path, data, axes):
+    """Write a real one-level OME-Zarr v2 image with zarr-python, without an omero block."""
+    import zarr
+
+    root = zarr.open_group(str(path), mode="w", zarr_format=2)
+    arr = root.create_array("0", shape=data.shape, dtype=data.dtype, chunks=data.shape,
+                            chunk_key_encoding={"name": "v2", "separator": "/"})
+    arr[:] = data
+    root.attrs["multiscales"] = [{"version": "0.4", "axes": axes, "datasets": [{"path": "0"}]}]
+
+
+def _omero(path):
+    return json.loads((path / "zarr.json").read_text())["attributes"]["omero"]
+
+
+class TestOmeroMetadata:
+    def test_single_channel_is_greyscale_full_range(self, tmp_path):
+        import numpy as np
+
+        store = tmp_path / "gray.zarr"
+        data = np.arange(0, 400, dtype=np.uint16).reshape(20, 20)
+        _make_real_v2_image(store, data, [{"name": "y", "type": "space"}, {"name": "x", "type": "space"}])
+        convert_zarr_v2_to_v3(str(store))
+        omero = _omero(store)
+        assert omero["rdefs"]["model"] == "greyscale"
+        assert len(omero["channels"]) == 1
+        assert omero["channels"][0]["window"] == {"start": 0, "end": 399, "min": 0, "max": 399}
+
+    def test_rgb_uint8_gets_rgb_block(self, tmp_path):
+        import numpy as np
+
+        store = tmp_path / "rgb.zarr"
+        data = np.random.default_rng(0).integers(0, 256, (3, 16, 16), dtype=np.uint8)
+        _make_real_v2_image(store, data, [{"name": "c", "type": "channel"},
+                                          {"name": "y", "type": "space"}, {"name": "x", "type": "space"}])
+        convert_zarr_v2_to_v3(str(store))
+        omero = _omero(store)
+        assert omero["rdefs"]["model"] == "color"
+        assert [c["label"] for c in omero["channels"]] == ["R", "G", "B"]
+        assert all(c["window"]["start"] == 0 and c["window"]["end"] == 255 for c in omero["channels"])
+
+    def test_multichannel_gets_one_colored_entry_per_channel(self, tmp_path):
+        import numpy as np
+
+        store = tmp_path / "multi.zarr"
+        data = np.zeros((4, 2, 8, 8), dtype=np.uint16)
+        for c in range(4):
+            data[c] = (c + 1) * 1000  # each channel has its own range
+            data[c, 0, 0, 0] = 0
+        _make_real_v2_image(store, data, [{"name": "c", "type": "channel"}, {"name": "z", "type": "space"},
+                                          {"name": "y", "type": "space"}, {"name": "x", "type": "space"}])
+        convert_zarr_v2_to_v3(str(store))
+        channels = _omero(store)["channels"]
+        assert len(channels) == 4
+        assert len({c["color"] for c in channels}) == 4
+        assert [c["window"]["max"] for c in channels] == [1000, 2000, 3000, 4000]
+
+    def test_channel_axis_last_and_plain_axis_names(self, tmp_path):
+        import numpy as np
+
+        store = tmp_path / "yxc.zarr"
+        data = np.zeros((8, 8, 2), dtype=np.uint16)
+        data[..., 1] = 500
+        _make_real_v2_image(store, data, ["y", "x", "c"])
+        convert_zarr_v2_to_v3(str(store))
+        channels = _omero(store)["channels"]
+        assert [c["window"]["max"] for c in channels] == [0, 500]
+
+    def test_existing_omero_is_kept(self, tmp_path):
+        import numpy as np
+        import zarr
+
+        store = tmp_path / "kept.zarr"
+        _make_real_v2_image(store, np.zeros((3, 4, 4), dtype=np.uint8),
+                            [{"name": "c", "type": "channel"}, {"name": "y", "type": "space"},
+                             {"name": "x", "type": "space"}])
+        zarr.open_group(str(store), mode="a", zarr_format=2).attrs["omero"] = {"channels": [{"color": "123456"}]}
+        convert_zarr_v2_to_v3(str(store))
+        assert _omero(store) == {"channels": [{"color": "123456"}]}
+
+    def test_v3_store_without_omero_gets_it(self, tmp_path):
+        import numpy as np
+        import zarr
+
+        out = tmp_path / "out"
+        root = zarr.open_group(str(out), mode="w", zarr_format=3)
+        arr = root.create_array("0", shape=(3, 8, 8), dtype=np.uint8, chunks=(3, 8, 8))
+        arr[:] = 7
+        root.attrs["multiscales"] = [{"version": "0.4", "datasets": [{"path": "0"}],
+                                      "axes": [{"name": "c", "type": "channel"}, {"name": "y", "type": "space"},
+                                               {"name": "x", "type": "space"}]}]
+        assert process_zarr_conversions(str(out)) == []
+        assert [c["label"] for c in _omero(out)["channels"]] == ["R", "G", "B"]
