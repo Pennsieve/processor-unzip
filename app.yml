@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://schemas.pennsieve.io/app-manifest/v1.json
+application:
+  name: Zipped Zarr Extractor
+  description: Unzips a zipped OME-Zarr (or other archive), converts Zarr v2 metadata to v3, and adds channel colors and display ranges for the Pennsieve image viewer
+  type: processor
+  tags:
+    - visualization
+    - microscopy
+runtime:
+  # Mostly disk-bound: the archive and its extracted copy both sit on disk. Channel ranges
+  # are computed from the smallest pyramid level, so memory needs are small.
+  cpu: 4096
+  memory: 16384
+  computeTypes:
+    - standard
