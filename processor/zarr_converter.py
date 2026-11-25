@@ -248,14 +248,93 @@ def _write_json(path: str, data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
-def _add_omero_window(zarr_path: str, root) -> None:
-    """Compute min/max from the smallest resolution level and add OMERO window metadata.
+# Same palette and RGB block as the TIFF converter (processor_tiff_zarr_converter build_omero), so
+# unzipped zarrs look the same as converted ones in the viewer and the thumbnail processor.
+FALLBACK_CHANNEL_COLORS = ["00FF00", "FF00FF", "00FFFF", "FF0000", "0000FF", "FFFF00"]
+RGB_CHANNELS = [("FF6699", "R"), ("00FF00", "G"), ("6699FF", "B")]
 
-    This sets the rendering range so viewers like Neuroglancer display
-    the correct contrast without manual adjustment.
+
+def _channel_axis(multiscale: dict, ndim: int) -> int | None:
+    """Index of the channel axis from the OME-NGFF axes, or None if there isn't one."""
+    axes = multiscale.get("axes") or []
+    if len(axes) != ndim:
+        return None
+    for i, ax in enumerate(axes):
+        if isinstance(ax, dict):
+            if ax.get("type") == "channel" or ax.get("name") == "c":
+                return i
+        elif ax == "c":  # OME-NGFF 0.3 lists axes as plain names
+            return i
+    return None
+
+
+def _window(values, integer: bool) -> dict:
+    """Display window: min/max over the values; start/end at their 0.1-99.9 percentiles."""
+    import numpy as np
+
+    vmin, vmax = values.min(), values.max()
+    lo, hi = np.percentile(values, [0.1, 99.9])
+    if integer:
+        vmin, vmax, lo, hi = int(vmin), int(vmax), int(lo), int(np.ceil(hi))
+    else:
+        vmin, vmax, lo, hi = float(vmin), float(vmax), float(lo), float(hi)
+    if hi <= lo:
+        hi = lo + 1
+    return {"start": lo, "end": hi, "min": vmin, "max": vmax}
+
+
+def build_omero(data, channel_axis: int | None) -> dict:
+    """OMERO rendering metadata for an image with no omero block of its own.
+
+    - No channel axis, or one channel: one grayscale channel (the old behavior).
+    - Three 8-bit channels: the RGB block the TIFF converter writes, which the viewer
+      and thumbnail processor treat as a color image.
+    - Anything else with channels: one entry per channel, each in its own color with
+      its own window, so every channel shows up instead of only the first one in gray.
     """
     import numpy as np
 
+    integer = np.issubdtype(data.dtype, np.integer)
+    n = data.shape[channel_axis] if channel_axis is not None else 1
+
+    if n == 1:
+        # Unchanged from before: the window spans the full min-max range.
+        w = _window(data, integer)
+        w["start"], w["end"] = w["min"], w["max"]
+        return {
+            "channels": [{"color": "FFFFFF", "label": "0", "active": True, "window": w}],
+            "rdefs": {"model": "greyscale"},
+        }
+
+    if n == 3 and data.dtype == np.uint8:
+        return {
+            "channels": [
+                {"color": color, "label": label, "active": True,
+                 "window": {"start": 0, "end": 255, "min": 0, "max": 255}}
+                for color, label in RGB_CHANNELS
+            ],
+            "rdefs": {"model": "color"},
+        }
+
+    channels = []
+    for c in range(n):
+        channels.append({
+            "color": FALLBACK_CHANNEL_COLORS[c % len(FALLBACK_CHANNEL_COLORS)],
+            "label": f"Channel {c + 1}",
+            "active": True,
+            "window": _window(np.take(data, c, axis=channel_axis), integer),
+        })
+    # No rdefs model, as in the TIFF converter: the viewer reads "color" with 3 channels as RGB.
+    return {"channels": channels}
+
+
+def _add_omero_window(zarr_path: str, root) -> None:
+    """Add OMERO rendering metadata (channel colors and display windows) when the zarr has none.
+
+    The windows are computed from the smallest resolution level, so viewers like
+    Neuroglancer show the right contrast without manual adjustment. An existing
+    omero block is never changed.
+    """
     multiscales = root.attrs.get("multiscales")
     if not multiscales or "omero" in root.attrs:
         return
@@ -267,31 +346,23 @@ def _add_omero_window(zarr_path: str, root) -> None:
     # Use the smallest (last) resolution level for fast min/max
     smallest_path = datasets[-1]["path"]
     try:
-        arr = root[smallest_path]
-        data = arr[:]
-        data_min, data_max = int(data.min()), int(data.max())
+        data = root[smallest_path][:]
+        omero = build_omero(data, _channel_axis(multiscales[0], data.ndim))
     except Exception as e:
-        log.warning(f"  Could not compute min/max for OMERO window: {e}")
+        log.warning(f"  Could not compute OMERO rendering metadata: {e}")
         return
 
-    log.info(f"  Computed rendering window from level {smallest_path}: {data_min}–{data_max}")
+    log.info(
+        f"  Computed rendering metadata from level {smallest_path}: "
+        + ", ".join(f"{ch['color']} {ch['window']['start']}–{ch['window']['end']}" for ch in omero["channels"])
+    )
 
     # Update root zarr.json with OMERO channel metadata
     zarr_json_path = os.path.join(zarr_path, "zarr.json")
     meta = _read_json(zarr_json_path)
-    meta["attributes"]["omero"] = {
-        "channels": [
-            {
-                "color": "FFFFFF",
-                "label": "0",
-                "active": True,
-                "window": {"start": data_min, "end": data_max, "min": data_min, "max": data_max},
-            }
-        ],
-        "rdefs": {"model": "greyscale"},
-    }
+    meta["attributes"]["omero"] = omero
     _write_json(zarr_json_path, meta)
-    log.info(f"  Added OMERO rendering window to {zarr_json_path}")
+    log.info(f"  Added OMERO rendering metadata to {zarr_json_path}")
 
 
 def convert_zarr_v2_to_v3(zarr_path: str) -> None:
@@ -365,4 +436,33 @@ def process_zarr_conversions(output_dir: str) -> list[str]:
         else:
             log.debug(f"Skipping non-v2 store: {store_path}")
 
+    # Stores that were already v3 skip the conversion, so give them rendering metadata here.
+    for store_path in _find_v3_group_roots(output_dir):
+        if store_path in converted:
+            continue
+        try:
+            import zarr
+
+            _add_omero_window(store_path, zarr.open_group(store_path, mode="r"))
+        except Exception as e:
+            log.warning(f"  Could not add OMERO rendering metadata to {store_path}: {e}")
+
     return converted
+
+
+def _find_v3_group_roots(output_dir: str) -> list[str]:
+    """Top-level Zarr v3 groups (directories whose zarr.json is a group), not nested sub-groups."""
+    candidates = []
+    for root, _dirs, files in os.walk(output_dir):
+        if "zarr.json" in files:
+            try:
+                if _read_json(os.path.join(root, "zarr.json")).get("node_type") == "group":
+                    candidates.append(root)
+            except (OSError, ValueError):
+                continue
+    candidates.sort()
+    roots = []
+    for path in candidates:
+        if not any(path.startswith(r + os.sep) for r in roots):
+            roots.append(path)
+    return roots
